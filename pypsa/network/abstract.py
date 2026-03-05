@@ -26,8 +26,7 @@ class _NetworkABC(ABC):
     # Indexing
     snapshots: pd.Index | pd.MultiIndex
     snapshot_weightings: pd.DataFrame
-    typical_period_map: pd.Series
-    typical_periods: pd.Series
+    storage_snapshots: pd.DataFrame
     _snapshots_data: pd.DataFrame
     investment_periods: pd.Index
     investment_period_weightings: pd.DataFrame
@@ -83,7 +82,7 @@ class _NetworkABC(ABC):
 
     @property
     @abstractmethod
-    def has_typical_periods(self) -> bool:
+    def has_representative_hours(self) -> bool:
         """Read only placeholder."""
         ...
 

@@ -13,8 +13,8 @@ from pypsa.clustering.temporal import (
     TemporalClustering,
     downsample,
     from_snapshot_map,
+    representative_hours,
     resample,
-    typical_periods,
 )
 
 
@@ -316,49 +316,49 @@ class TestSegment:
         assert hasattr(n.cluster.temporal, "segment")
 
 
-class TestTypicalPeriod:
+class TestRH:
     # typical periods relies on tsam, so skip if not installed
     pytest.importorskip("tsam")
 
     @pytest.mark.parametrize(
-        ("num_periods", "num_days", "expected_hours"),
-        [(1, 1, 24), (2, 1, 48), (1, 7, 168)],
+        "num_rh",
+        [1, 2, 4, 24],
     )
-    def test_1_typical_day(self, simple_network, num_periods, num_days, expected_hours):
+    def test_representative_hours(self, simple_network, num_rh):
         n = simple_network
-        result = typical_periods(n, num_periods, num_days)
+        result = representative_hours(n, num_rh)
 
         assert isinstance(result, TemporalClustering)
-        assert len(result.n.snapshots) == expected_hours
+        assert len(result.n.snapshots) == num_rh
         assert np.isclose(
-            result.n.snapshot_weightings["objective"].sum() * (168 / expected_hours),
+            result.n.snapshot_weightings["objective"].sum() * (168 / num_rh),
             n.snapshot_weightings["objective"].sum(),
         )
 
-    def test_typical_period_preserves_period_data(self, simple_network):
+    def test_representative_hours_preserves_period_data(self, simple_network):
         n = simple_network
         original_data = n.generators_t["p_max_pu"]
 
-        result = typical_periods(n, 1, 1)
+        result = representative_hours(n, 1)
         new_data = result.n.generators_t["p_max_pu"]
 
         assert original_data.reindex(new_data.index).equals(new_data)
 
-    def test_typical_period_preserves_snapshot_weightings(self, simple_network):
+    def test_representative_hours_preserves_snapshot_weightings(self, simple_network):
         n = simple_network
         original_data = n.snapshot_weightings["objective"]
 
-        result = typical_periods(n, 1, 1)
+        result = representative_hours(n, 1)
         new_data = result.n.snapshot_weightings["objective"]
 
         assert original_data.reindex(new_data.index).equals(new_data)
 
-    def test_typical_period_accessor(self, simple_network):
+    def test_representative_hours_accessor(self, simple_network):
         n = simple_network
-        m = n.cluster.temporal.typical_periods(2, 2)
+        m = n.cluster.temporal.representative_hours(2)
 
         assert isinstance(m, pypsa.Network)
-        assert len(m.snapshots) == 96  # 2 typical periods * 2 days * 24 hours
+        assert len(m.snapshots) == 2  # 2 representative hours
 
 
 class TestEdgeCases:
@@ -580,21 +580,15 @@ class TestSegmentFunctionality:
         assert isinstance(result.snapshot_map, pd.Series)
 
 
-class TestTypicalPeriodErrors:
-    def test_typical_period_invalid_num_periods(self, simple_network):
-        """You can't have 0 typical periods."""
+class TestRepresentativeHoursErrors:
+    def test_representative_hours_invalid_num_hours(self, simple_network):
+        """You can't have 0 representative hours."""
         n = simple_network
-        with pytest.raises(ValueError, match="num_typical_periods must be >= 1"):
-            typical_periods(n, num_days_per_period=1, num_typical_periods=0)
+        with pytest.raises(ValueError, match="num_representative_hours must be >= 1"):
+            representative_hours(n, num_representative_hours=0)
 
-    def test_typical_period_invalid_num_days(self, simple_network):
-        """You can't have 0 days per typical period."""
-        n = simple_network
-        with pytest.raises(ValueError, match="num_days_per_period must be >= 1"):
-            typical_periods(n, num_days_per_period=0, num_typical_periods=1)
-
-    def test_typical_period_invalid_num_days_period_product(self, simple_network):
-        """You can't ask for more typical days than exist in the snapshots."""
+    def test_representative_hours_invalid_num_days_period_product(self, simple_network):
+        """You can't ask for more representative days than exist in the snapshots."""
         n = simple_network
         with pytest.raises(
             ValueError,
@@ -602,31 +596,31 @@ class TestTypicalPeriodErrors:
                 "Number of days represented by the typical periods (100) cannot exceed number of unique days in snapshots (7)"
             ),
         ):
-            typical_periods(n, num_days_per_period=10, num_typical_periods=10)
+            representative_hours(n, num_representative_hours=200)
 
-    def test_typical_period_multiperiod_raises(self, multiperiod_network):
+    def test_representative_hours_multiperiod_raises(self, multiperiod_network):
         """Not implemented for multiperiod networks (yet)."""
         n = multiperiod_network
         with pytest.raises(NotImplementedError, match="does not yet support"):
-            typical_periods(n, 2, 2)
+            representative_hours(n, 2)
 
-    def test_typical_period_no_dt_snapshots(self):
-        """Snapshots must be a datetimeindex for typical_periods."""
+    def test_representative_hours_no_dt_snapshots(self):
+        """Snapshots must be a datetimeindex for representative_hours."""
         n = pypsa.Network()
         n.set_snapshots(range(24))
         n.add("Bus", "bus0")
         n.add("Generator", "gen0", bus="bus0", p_nom=100)
 
         with pytest.raises(TypeError, match="requires snapshots to be a DatetimeIndex"):
-            typical_periods(n, 1, 1)
+            representative_hours(n, 1)
 
-    def test_typical_period_irregular_frequency(self, simple_network):
-        """Snapshot frequency must be regular within the number of days represented by the typical periods."""
+    def test_representative_hours_irregular_frequency(self, simple_network):
+        """Snapshot frequency must be regular within the number of days represented by the representative hours."""
         pytest.importorskip("tsam")
-        # Segmenting the simple network creates irregular snapshot frequency, so we can reuse that for testing typical_periods error handling
+        # Segmenting the simple network creates irregular snapshot frequency, so we can reuse that for testing representative_hours error handling
         irregular_n = simple_network.cluster.temporal.segment(10)
         with pytest.raises(ValueError, match="Error preparing TSAM aggregation:"):
-            typical_periods(irregular_n, 1, 1)
+            representative_hours(irregular_n, 24)
 
 
 class TestStochasticNotSupported:

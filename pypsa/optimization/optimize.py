@@ -53,7 +53,6 @@ from pypsa.optimization.global_constraints import (
 )
 from pypsa.optimization.variables import (
     define_cvar_variables,
-    define_inter_period_storage_variables,
     define_loss_variables,
     define_modular_variables,
     define_nominal_variables,
@@ -212,11 +211,9 @@ def define_objective(
     weighting = n.snapshot_weightings.objective
     if n._multi_invest:
         weighting = weighting.mul(period_weighting, level=0).loc[sns]
-    elif n.has_typical_periods:
-        typical_period_weighting = n.typical_periods.map(
-            n.typical_period_map.value_counts()
-        )
-        weighting = weighting.mul(typical_period_weighting, level=0).loc[sns]
+    elif n.has_representative_hours:
+        rh_weighting = n.storage_snapshots.groupby("representative_hour").weight.sum()
+        weighting = weighting.mul(rh_weighting, level=0).loc[sns]
     else:
         weighting = weighting.loc[sns]
     weight = xr.DataArray(weighting.values, coords={"snapshot": sns}, dims=["snapshot"])
@@ -609,9 +606,6 @@ class OptimizationAccessor(OptimizationAbstractMixin):
         # CVaR auxiliary variables (only when stochastic + risk preference is set)
         define_cvar_variables(n)
 
-        # Inter-typical-period storage variables (only for networks with snapshots aggregated to non-contiguous typical periods)
-        define_inter_period_storage_variables(n)
-
         if transmission_losses:
             for c in n.passive_branch_components:
                 define_loss_variables(n, sns, c)
@@ -787,7 +781,7 @@ class OptimizationAccessor(OptimizationAbstractMixin):
             c = n.c[_c_name]
             df = _from_xarray(sol, c)
 
-            if any(dim in sol.dims for dim in ["snapshot", "day", "typical_period"]):
+            if any(dim in sol.dims for dim in ["snapshot", "storage_snapshot"]):
                 if c.name in n.passive_branch_components and attr == "s":
                     _set_dynamic_data(n, c.name, "p0", df)
                     _set_dynamic_data(n, c.name, "p1", -df)

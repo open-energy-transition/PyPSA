@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import linopy
 import pandas as pd
@@ -30,6 +30,8 @@ if TYPE_CHECKING:
     from pypsa import Network
 
     ArgItem = list[str | int | float | DataArray]
+
+    T = TypeVar("T", bound=DataArray | linopy.Variable | linopy.LinearExpression)
 
 logger = logging.getLogger(__name__)
 
@@ -101,17 +103,16 @@ def define_operational_constraints_for_non_extendables(
     if "snapshot" in min_pu.dims:
         min_pu = min_pu.sel(snapshot=sns)
         max_pu = max_pu.sel(snapshot=sns)
-    if n.has_typical_periods and (attr, component) in [
-        ("state_of_charge", "StorageUnit"),
-        ("e", "Store"),
-    ]:
-        # For stores and storageunits with typical periods we ignore the reservoir bounds here.
-        # We will enforce them separately using other variables and constraints.
-        return
     lower = min_pu * nominal_fix
     upper = max_pu * nominal_fix
 
     active = c.da.active.sel(name=fix_i, snapshot=sns)
+    if n.has_representative_hours and (attr, component) in [
+        ("state_of_charge", "StorageUnit"),
+        ("e", "Store"),
+    ]:
+        orig_sns, _ = _rh_idx_weights(n, sns)
+        active = _to_storage_sns(n, active, orig_sns)
 
     dispatch = n.model[f"{c.name}-{attr}"].sel(name=fix_i)
 
@@ -181,17 +182,18 @@ def define_operational_constraints_for_extendables(
     if "snapshot" in min_pu.dims:
         min_pu = min_pu.sel(snapshot=sns)
         max_pu = max_pu.sel(snapshot=sns)
-    if n.has_typical_periods and (attr, component) in [
-        ("state_of_charge", "StorageUnit"),
-        ("e", "Store"),
-    ]:
-        # For stores and storageunits with typical periods we ignore the reservoir bounds here.
-        # We will enforce them separately using other variables and constraints.
-        return
 
     dispatch = n.model[f"{c.name}-{attr}"].sel(name=ext_i)
     capacity = n.model[f"{c.name}-{nominal_attrs[c.name]}"]
     active = c.da.active.sel(name=ext_i, snapshot=sns)
+
+    if n.has_representative_hours and (attr, component) in [
+        ("state_of_charge", "StorageUnit"),
+        ("e", "Store"),
+    ]:
+        active = _to_storage_sns(n, active)
+        min_pu = _to_storage_sns(n, min_pu)
+        max_pu = _to_storage_sns(n, max_pu)
 
     lhs_lower = dispatch - min_pu * capacity
     lhs_upper = dispatch - max_pu * capacity
@@ -1299,7 +1301,7 @@ def define_storage_unit_constraints(n: Network, sns: pd.Index) -> None:
     """
     m = n.model
     component = "StorageUnit"
-    dim = "snapshot"
+    dim = "storage_snapshot" if n.has_representative_hours else "snapshot"
     c = as_components(n, component)
     active = c.da.active.sel(snapshot=sns, name=c.active_assets)
 
@@ -1313,39 +1315,59 @@ def define_storage_unit_constraints(n: Network, sns: pd.Index) -> None:
         eh = eh.unstack("dim_1")
     except ValueError:
         pass
-
+    weights = (
+        n.storage_snapshots.weight.to_xarray() if n.has_representative_hours else 1
+    )
     # efficiencies as xarray DataArrays
-    eff_stand = (1 - c.da.standing_loss.sel(snapshot=sns, name=c.active_assets)) ** eh
-    eff_dispatch = c.da.efficiency_dispatch.sel(snapshot=sns, name=c.active_assets)
-    eff_store = c.da.efficiency_store.sel(snapshot=sns, name=c.active_assets)
+    eh = _to_storage_sns(n, eh)
+    standing_loss = _to_storage_sns(
+        n, (1 - c.da.standing_loss.sel(snapshot=sns, name=c.active_assets))
+    )
+
+    eff_stand = standing_loss ** (eh * weights)
+    eh_weighted = ((eff_stand - 1) / (standing_loss - 1)).fillna(eh * weights)
+    # eff_stand_intra =
+    eff_dispatch = _to_storage_sns(
+        n, c.da.efficiency_dispatch.sel(snapshot=sns, name=c.active_assets)
+    )
+    eff_store = _to_storage_sns(
+        n, c.da.efficiency_store.sel(snapshot=sns, name=c.active_assets)
+    )
 
     soc = m[f"{component}-state_of_charge"]
 
     lhs = [
         (-1, soc),
-        (-1 / eff_dispatch * eh, m[f"{component}-p_dispatch"]),
-        (eff_store * eh, m[f"{component}-p_store"]),
+        (
+            -1 / eff_dispatch * eh_weighted,
+            _to_storage_sns(n, m[f"{component}-p_dispatch"]),
+        ),
+        (eff_store * eh_weighted, _to_storage_sns(n, m[f"{component}-p_store"])),
     ]
 
     if f"{component}-spill" in m.variables:
-        lhs += [(-eh, m[f"{component}-spill"])]
+        lhs += [(-eh_weighted, _to_storage_sns(n, m[f"{component}-spill"]))]
 
     # We create a mask `include_previous_soc` which excludes the first snapshot
     # for non-cyclic assets
     noncyclic_b = ~c.da.cyclic_state_of_charge.sel(name=c.active_assets)
+    active = _to_storage_sns(n, active)
     include_previous_soc = (active.cumsum(dim) != 1).where(noncyclic_b, True)
 
     previous_soc = (
         soc.where(active)
         .ffill(dim)
-        .roll(snapshot=1)
+        .roll(**{dim: 1})
         .ffill(dim)
         .where(include_previous_soc)
     )
 
     # We add inflow and initial soc for noncyclic assets to rhs
     soc_init = c.da.state_of_charge_initial.sel(name=c.active_assets)
-    rhs = -c.da.inflow.sel(snapshot=sns, name=c.active_assets) * eh
+    rhs = (
+        _to_storage_sns(n, -c.da.inflow.sel(snapshot=sns, name=c.active_assets))
+        * eh_weighted
+    )
 
     if n._multi_invest:
         # If multi-horizon optimizing, we update the previous_soc and the rhs
@@ -1441,13 +1463,6 @@ def define_storage_unit_constraints(n: Network, sns: pd.Index) -> None:
 
     m.add_constraints(lhs, "=", rhs, name=f"{component}-energy_balance", mask=active)
 
-    if n.has_typical_periods:
-        _define_inter_typical_period_storage_constraints(
-            n, component, eff_stand, noncyclic_b, rhs - soc_init
-        )
-
-        # TODO: propagate cluster weights across all constraints
-
 
 def define_store_constraints(n: Network, sns: pd.Index) -> None:
     """Define energy balance constraints for stores.
@@ -1508,7 +1523,7 @@ def define_store_constraints(n: Network, sns: pd.Index) -> None:
     """
     m = n.model
     component = "Store"
-    dim = "snapshot"
+    dim = "storage_snapshot" if n.has_representative_hours else "snapshot"
     c = as_components(n, component)
     active = c.da.active.sel(snapshot=sns, name=c.active_assets)
 
@@ -1523,23 +1538,31 @@ def define_store_constraints(n: Network, sns: pd.Index) -> None:
     if n.has_scenarios and "dim_1" in eh.dims:
         eh = eh.unstack("dim_1")
 
+    weights = (
+        n.storage_snapshots.weight.to_xarray() if n.has_representative_hours else 1
+    )
     # standing efficiency
-    eff_stand = (1 - c.da.standing_loss.sel(snapshot=sns, name=c.active_assets)) ** eh
-
-    e = m[f"{component}-e"]
-    p = m[f"{component}-p"]
+    standing_loss = _to_storage_sns(
+        n, (1 - c.da.standing_loss.sel(snapshot=sns, name=c.active_assets))
+    )
+    eh = _to_storage_sns(n, eh)
+    eff_stand = standing_loss ** (eh * weights)
+    eh_weighted = ((eff_stand - 1) / (standing_loss - 1)).fillna(eh * weights)
+    e = _to_storage_sns(n, m[f"{component}-e"])
+    p = _to_storage_sns(n, m[f"{component}-p"])
 
     # Define LHS expression
-    lhs = [(-1, e), (-eh, p)]
+    lhs = [(-1, e), (-eh_weighted, p)]
 
     # We create a mask `include_previous_e` which excludes the first snapshot
     # for non-cyclic assets
+    active = _to_storage_sns(n, active)
     noncyclic_b = ~c.da.e_cyclic.sel(name=c.active_assets)
     include_previous_e = (active.cumsum(dim) != 1).where(noncyclic_b, True)
 
     # Calculate previous energy state with proper handling of boundaries
     previous_e = (
-        e.where(active).ffill(dim).roll(snapshot=1).ffill(dim).where(include_previous_e)
+        e.where(active).ffill(dim).roll(**{dim: 1}).ffill(dim).where(include_previous_e)
     )
 
     # We add initial e for non-cyclic assets to rhs
@@ -1629,139 +1652,20 @@ def define_store_constraints(n: Network, sns: pd.Index) -> None:
 
     m.add_constraints(lhs, "=", rhs, name=f"{component}-energy_balance", mask=active)
 
-    if n.has_typical_periods:
-        _define_inter_typical_period_storage_constraints(
-            n, component, eff_stand, noncyclic_b, e_init
-        )
 
-
-def _define_inter_typical_period_storage_constraints(
-    n: Network,
-    component: str,
-    eff_stand: DataArray,
-    noncyclic_b: DataArray,
-    soc_init: DataArray,
-) -> None:
-    """Define inter-typical-period constraints for storage components."""
-    attr = (
-        "state_of_charge"
-        if component == "StorageUnit"
-        else "e"
-        if component == "Store"
-        else None
-    )
-    if attr is None:
-        msg = f"Component {component} is not supported for inter-typical-period storage constraints."
-        raise ValueError(msg)
-    m = n.model
-    c = as_components(n, component)
-    soc_var = m[f"{component}-{attr}"]
-    typical_period_da = n.typical_periods.to_xarray().rename("typical_period")
-    typical_period_map_da = n.typical_period_map.to_xarray().rename("day")
-    min_pu, max_pu = c.get_bounds_pu(attr=attr)
-    nom_attr = nominal_attrs[c.name]
-    is_extendable = c.da[f"{nom_attr}_extendable"]
-    if is_extendable.any():
-        capacity_ext = m[f"{c.name}-{nom_attr}"]
+def _to_storage_sns(n: Network, var: T) -> T:
+    """Helper function to map variables to original snapshots for typical period models."""
+    if "snapshot" not in var.dims or not n.has_representative_hours:
+        new_var = var
     else:
-        capacity_ext = 0
-    capacity_fixed = c.da[nom_attr]
-    capacity = capacity_ext + capacity_fixed.where(~is_extendable)
-
-    for op_, bound_, pu in [(">=", "lower", min_pu), ("<=", "upper", max_pu)]:
-        var = m[f"{component}-{attr}_intra_period_{bound_}"].sel(
-            typical_period=typical_period_da
-        )
-        # Hack because linopy adds unallocated coords to the constraint if they are left lying around
-        var._data = var._data.drop_vars("typical_period")
-        lhs = [(1, soc_var)]
-        rhs = var
-        if component == "Store" and bound_ == "upper":
-            rhs -= (1 - pu) * capacity
-        if component == "Store" and bound_ == "lower":
-            rhs += pu * capacity
-
-        m.add_constraints(
-            soc_var, op_, rhs, name=f"{component}-{attr}-intra-typical-period-{bound_}"
-        )
-
-    inter_period_var = m[f"{component}-{attr}_inter_period"]
-
-    snapshots_per_typical_period = {
-        "final": n.typical_periods[n.typical_periods.diff().shift(-1) != 0],
-        "first": n.typical_periods[n.typical_periods.diff() != 0],
-    }
-    # To map typical period to final snapshot of that period, we need to swap idx and values
-    snapshots_per_typical_period_pivoted = {
-        k: pd.Series(v.index, index=pd.Index(v.values, name="typical_period"))
-        for k, v in snapshots_per_typical_period.items()
-    }
-    snapshots_per_day = {
-        k: n.typical_period_map.map(v).to_xarray()
-        for k, v in snapshots_per_typical_period_pivoted.items()
-    }
-
-    # standing loss of energy from the previous inter-typical period storage
-    # is that for the first snapshot of each typical period,
-    # mapped to each day based on the typical period to which it belongs.
-    standing_loss_per_typical_period = (
-        eff_stand.groupby(typical_period_da)
-        .prod()
-        .sel(typical_period=typical_period_map_da)
-        .drop_vars("typical_period")
-    )
-
-    for op_, bound_, pu in [(">=", "lower", min_pu), ("<=", "upper", max_pu)]:
-        var = m[f"{component}-{attr}_intra_period_{bound_}"].sel(
-            typical_period=typical_period_map_da
-        )
-        # Hack because linopy adds unallocated coords to the constraint if they are left lying around
-        var._data = var._data.drop_vars("typical_period")
-
-        lhs = [(standing_loss_per_typical_period, inter_period_var), (1, var)]
-        if component == "StorageUnit":
-            rhs = pu * capacity
-        elif component == "Store" and bound_ == "upper":
-            rhs = capacity
-        elif component == "Store" and bound_ == "lower":
-            rhs = 0
-        m.add_constraints(
-            lhs, op_, rhs, name=f"{component}-{attr}-inter-typical-period-{bound_}"
-        )
-
-    first_day = inter_period_var.coords["day"] == inter_period_var.coords["day"][0]
-    include_previous_inter = ~(first_day & noncyclic_b)
-    previous_var = inter_period_var.roll(day=1).where(include_previous_inter)
-    intra_var = (
-        m[f"{component}-{attr}"]
-        .sel(snapshot=snapshots_per_day["final"].roll(day=1))
-        .where(include_previous_inter)
-    )
-    # Hack because linopy adds unallocated coords to the constraint if they are left lying around
-    intra_var._data = intra_var._data.drop_vars("snapshot")
-
-    lhs = [
-        (1, inter_period_var),
-        (-standing_loss_per_typical_period, previous_var),
-        (-1, intra_var),
-    ]
-    rhs = (
-        soc_init.where(n.snapshots.to_series().to_xarray())
-        .sel(snapshot=snapshots_per_day["first"])
-        .where(~include_previous_inter, 0)
-    ).drop_vars("snapshot")
-    m.add_constraints(
-        lhs, "=", rhs, name=f"{component}-energy_balance_typical_period_inter"
-    )
-
-    # Update energy balance constraints to fix initial e in first snapshot of each typical period to zero
-    # This is based on the previous e being added as the final term in the LHS expression
-    new_coeffs = eff_stand.where(
-        ~eff_stand.snapshot.isin(snapshots_per_typical_period["first"].index), 0
-    )
-    m.constraints[f"{component}-energy_balance"].coeffs.loc[
-        {"_term": m.constraints[f"{component}-energy_balance"].coords["_term"][-1]}
-    ] = new_coeffs
+        storage_sns = n.storage_snapshots.representative_hour.to_xarray()
+        # Map variable to original snapshots using typical_period_map
+        new_var = var.sel(snapshot=storage_sns)
+        if isinstance(new_var, DataArray):
+            new_var = new_var.drop_vars("snapshot")
+        else:
+            new_var._data = new_var._data.drop_vars("snapshot")
+    return new_var
 
 
 def define_loss_constraints(

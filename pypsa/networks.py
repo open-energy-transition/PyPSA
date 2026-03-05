@@ -155,11 +155,9 @@ class Network(
         index = pd.Index([], name="scenario")
         self._scenarios_data: pd.DataFrame = pd.DataFrame([], index=index, columns=cols)
 
-        # typical periods
-        index = pd.Index([], name="day")
-        self.typical_periods: pd.Series = pd.Series([], index=index, dtype=int)
-        index = pd.Index([], name="snapshot")
-        self.typical_period_map: pd.Series = pd.Series([], index=index, dtype=int)
+        # storage snapshots (for representative hours)
+        index = pd.Index([], name="storage_snapshot")
+        self.storage_snapshots: pd.DataFrame = pd.DataFrame([], index=index)
 
         # Risk preference
         self._risk_preference: dict[str, float] | None = None

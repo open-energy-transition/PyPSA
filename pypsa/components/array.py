@@ -97,9 +97,9 @@ def _from_xarray(da: xr.DataArray, c: Components) -> pd.DataFrame | pd.Series:
         return da.to_pandas()
 
     # Handle cases when using typical days
-    elif dims.intersection({"day", "typical_period"}):
+    elif dims.intersection({"storage_snapshot"}):
         return da.transpose(
-            "day", "typical_period", "name", missing_dims="ignore"
+            "storage_snapshot", "name", missing_dims="ignore"
         ).to_pandas()
 
     # Handle other cases

@@ -157,12 +157,12 @@ class ComponentsIndexMixin(_ComponentsABC):
         return self.n_save.has_periods
 
     @property
-    def has_typical_periods(self) -> bool:
+    def has_representative_hours(self) -> bool:
         """Investment periods of the network.
 
         <!-- md:badge-version v0.34.0 -->
         """
-        return self.n_save.has_typical_periods
+        return self.n_save.has_representative_hours
 
     @property
     def scenarios(self) -> pd.Index:

@@ -589,10 +589,9 @@ def segment(
     return TemporalClustering(m, snapshot_map)
 
 
-def typical_periods(
+def representative_hours(
     n: Network,
-    num_typical_periods: int,
-    num_days_per_period: int = 1,
+    num_representative_hours: int,
     *,
     solver: str = "highs",
     exclude_attrs: list[str] | None = None,
@@ -604,10 +603,8 @@ def typical_periods(
     ----------
     n : Network
         Network with original resolution.
-    num_typical_periods : int
-        Target number of typical periods.
-    num_days_per_period : int, default 1
-        Number of days per typical period.
+    num_representative_hours : int
+        Target number of representative hours.
     solver : str, default "highs"
         MIP solver for time clustering.
     exclude_attrs : list, optional
@@ -629,67 +626,64 @@ def typical_periods(
     _check_no_scenarios(n)
 
     if n.has_periods:
-        msg = "typical_periods() does not yet support networks with investment periods"
+        msg = "representative_hours() does not yet support networks with investment periods"
         raise NotImplementedError(msg)
 
     if not isinstance(n.snapshots, pd.DatetimeIndex):
-        msg = "typical_periods() requires snapshots to be a DatetimeIndex"
+        msg = "representative_hours() requires snapshots to be a DatetimeIndex"
         raise TypeError(msg)
 
-    if num_typical_periods < 1:
-        msg = f"num_typical_periods must be >= 1, got {num_typical_periods}"
+    if num_representative_hours < 1:
+        msg = f"num_representative_hours must be >= 1, got {num_representative_hours}"
         raise ValueError(msg)
 
-    if num_days_per_period < 1:
-        msg = f"num_days_per_period must be >= 1, got {num_days_per_period}"
-        raise ValueError(msg)
-
-    if num_typical_periods * num_days_per_period > len(np.unique(n.snapshots.date)):
+    if num_representative_hours > len(n.snapshots):
         msg = (
-            f"Number of days represented by the typical periods "
-            f"({num_typical_periods * num_days_per_period:.0f}) cannot exceed number of "
-            f"unique days in snapshots ({len(np.unique(n.snapshots.date))})"
+            f"Number of representative hours ({num_representative_hours}) cannot exceed "
+            f"the number of snapshots ({len(n.snapshots)})"
         )
         raise ValueError(msg)
+
     agg, _, _ = _prep_tsam_agg(
         n,
         exclude_attrs=exclude_attrs,
-        hoursPerPeriod=num_days_per_period * 24,
-        noTypicalPeriods=num_typical_periods,
+        hoursPerPeriod=1,
+        noTypicalPeriods=num_representative_hours,
         segmentation=False,
         solver=solver,
         **tsam_kwargs,
     )
-    clustered = agg.createTypicalPeriods()
+    _ = agg.createTypicalPeriods()
     matched_indices = agg.indexMatching()
-    representative_dates = (
-        agg.timeSeries.resample(f"{num_days_per_period}D")
-        .first()
-        .iloc[agg.clusterCenterIndices]
-        .index
-    )
-    new_snapshots = pd.Index([], dtype=n.snapshots.dtype)
-    clusters = []
-    for idx, day in enumerate(representative_dates):
-        first_day = day.strftime("%Y-%m-%d")
-        last_day = (day.date() + pd.Timedelta(days=num_days_per_period - 1)).strftime(
-            "%Y-%m-%d"
-        )
-        extra_snapshots = agg.timeSeries.loc[slice(first_day, last_day)].index
-        new_snapshots = new_snapshots.append(extra_snapshots)
-        clusters.append(pd.Series(idx, index=extra_snapshots))
-
+    new_snapshots = agg.timeSeries.iloc[agg.clusterCenterIndices].index
     m = n.copy()
     m.set_snapshots(new_snapshots)
-    m.typical_periods = pd.concat(clusters).rename_axis(index="snapshot")
-    typical_period_map = (
-        matched_indices.resample(f"{num_days_per_period}D").first().PeriodNum
+    representative_hours = matched_indices.loc[new_snapshots].PeriodNum
+    rh_map = matched_indices.PeriodNum
+
+    # Keep only the snapshots where the representative hour changes
+    storage_snapshots = rh_map.diff().fillna(1).where(lambda x: x != 0).dropna().index
+    rh_per_storage_snapshot = rh_map.map(
+        representative_hours.reset_index().set_index("PeriodNum").snapshot
+    ).loc[storage_snapshots]
+    storage_snapshot_weights = (
+        rh_per_storage_snapshot.reindex(rh_map.index)
+        .notnull()
+        .fillna(True)
+        .cumsum()
+        .value_counts()
+        .sort_index()
     )
-    typical_period_map.index = typical_period_map.index.strftime("%Y-%m-%d").rename(
-        "day"
+
+    m.storage_snapshots = pd.DataFrame(
+        data={
+            "original_snapshot": storage_snapshots,
+            "representative_hour": rh_per_storage_snapshot.values,
+            "weight": storage_snapshot_weights.values,
+        },
+        index=pd.Index(storage_snapshot_weights.index, name="storage_snapshot"),
     )
-    m.typical_period_map = typical_period_map
-    return TemporalClustering(m, typical_period_map)
+    return TemporalClustering(m, rh_map)
 
 
 def _prep_tsam_agg(

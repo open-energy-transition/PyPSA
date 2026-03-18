@@ -112,6 +112,8 @@ def define_operational_constraints_for_non_extendables(
         ("e", "Store"),
     ]:
         active = _to_storage_sns(n, active)
+        lower = _to_storage_sns(n, lower)
+        upper = _to_storage_sns(n, upper)
 
     dispatch = n.model[f"{c.name}-{attr}"].sel(name=fix_i)
 
